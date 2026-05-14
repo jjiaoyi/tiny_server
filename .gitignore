@@ -37,4 +37,5 @@ logs/
 .codex/
 .agents/
 
-bench/results/*.txt
+bench/results/*
+!bench/results/.gitkeep
