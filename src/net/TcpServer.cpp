@@ -6,7 +6,9 @@
 #include "net/SocketUtil.h"
 #include "util/FileUtil.h"
 
+#include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <cstring>
 #include <netinet/in.h>
 #include <poll.h>
@@ -14,17 +16,29 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <vector>
 
 namespace {
 constexpr size_t kMaxRequestSize = 8192;
+constexpr int kSendTimeoutMs = 3000;
 
 std::string makeClientLogPrefix(int fd) {
     return "client fd=" + std::to_string(fd) + " ";
 }
+
+std::string toLower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
 }
 
-TcpServer::TcpServer(int port, std::string wwwRoot, size_t threadCount)
-    : port_(port), wwwRoot_(std::move(wwwRoot)), threadPool_(threadCount) {
+TcpServer::TcpServer(int port, std::string wwwRoot, size_t threadCount, bool accessLogEnabled)
+    : port_(port),
+      wwwRoot_(std::move(wwwRoot)),
+      accessLogEnabled_(accessLogEnabled),
+      threadPool_(threadCount) {
 }
 
 TcpServer::~TcpServer() {
@@ -39,12 +53,16 @@ bool TcpServer::start() {
 
     // listen fd 只需要关注可读事件：有新连接进入 accept 队列。
     if (!poller_.addFd(listenFd_, EPOLLIN)) {
+        SocketUtil::closeFd(listenFd_);
+        listenFd_ = -1;
         return false;
     }
 
     running_ = true;
     Logger::instance().info("server started, listen on port " + std::to_string(port_) +
-                            ", www root: " + wwwRoot_);
+                            ", www root: " + wwwRoot_ +
+                            ", idle timeout: " + std::to_string(idleTimeout_.count()) + "s" +
+                            ", access log: " + (accessLogEnabled_ ? "on" : "off"));
 
     while (running_) {
         auto events = poller_.wait(1000);
@@ -55,19 +73,31 @@ bool TcpServer::start() {
                 continue;
             }
 
-            if (event.events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-                Logger::instance().warn(makeClientLogPrefix(event.fd) + "epoll error/hup");
+            if (event.events & EPOLLERR) {
+                Logger::instance().warn(makeClientLogPrefix(event.fd) + "epoll error");
                 closeClient(event.fd);
                 continue;
             }
 
             if (event.events & EPOLLIN) {
                 int clientFd = event.fd;
+                if (!markProcessing(clientFd)) {
+                    continue;
+                }
+
                 // EPOLLONESHOT 保证同一个 client fd 的读事件只触发一次。
-                // 处理任务交给线程池，避免主线程被业务处理阻塞。
+                // 主线程只分发任务，具体读写和 HTTP 处理由线程池执行。
                 threadPool_.enqueue([this, clientFd]() { handleClient(clientFd); });
+                continue;
+            }
+
+            if (event.events & (EPOLLHUP | EPOLLRDHUP)) {
+                Logger::instance().info(makeClientLogPrefix(event.fd) + "peer closed");
+                closeClient(event.fd);
             }
         }
+
+        closeIdleConnections();
     }
 
     return true;
@@ -79,6 +109,18 @@ void TcpServer::stop() {
     if (listenFd_ >= 0) {
         SocketUtil::closeFd(listenFd_);
         listenFd_ = -1;
+    }
+
+    std::vector<int> fds;
+    {
+        std::lock_guard<std::mutex> lock(connectionsMutex_);
+        for (const auto& item : connections_) {
+            fds.push_back(item.first);
+        }
+    }
+
+    for (int fd : fds) {
+        closeClient(fd);
     }
 }
 
@@ -106,9 +148,10 @@ void TcpServer::acceptConnections() {
             continue;
         }
 
+        std::string peer = SocketUtil::getPeerAddress(clientFd);
         {
-            std::lock_guard<std::mutex> lock(buffersMutex_);
-            clientBuffers_[clientFd] = "";
+            std::lock_guard<std::mutex> lock(connectionsMutex_);
+            connections_[clientFd] = Connection{"", peer, std::chrono::steady_clock::now(), false};
         }
 
         // client fd 注册 EPOLLIN 和 EPOLLONESHOT：
@@ -119,7 +162,7 @@ void TcpServer::acceptConnections() {
         }
 
         Logger::instance().info("client connected: fd=" + std::to_string(clientFd) +
-                                ", peer=" + SocketUtil::getPeerAddress(clientFd));
+                                ", peer=" + peer);
     }
 }
 
@@ -133,17 +176,14 @@ void TcpServer::handleClient(int clientFd) {
 
         if (n > 0) {
             bool requestTooLarge = false;
-            {
-                std::lock_guard<std::mutex> lock(buffersMutex_);
-                std::string& requestData = clientBuffers_[clientFd];
-                requestData.append(buffer, static_cast<size_t>(n));
-
-                requestTooLarge = requestData.size() > kMaxRequestSize;
-                headerComplete = requestData.find("\r\n\r\n") != std::string::npos;
+            if (!appendClientData(clientFd, buffer, static_cast<size_t>(n), headerComplete,
+                                  requestTooLarge)) {
+                return;
             }
 
             if (requestTooLarge) {
                 HttpResponse response = HttpResponse::text(400, "Bad Request", "Bad Request\n");
+                response.setHeader("Connection", "close");
                 sendAll(clientFd, response.toString());
                 Logger::instance().warn(makeClientLogPrefix(clientFd) + "request too large, status=400");
                 closeClient(clientFd);
@@ -178,55 +218,147 @@ void TcpServer::handleClient(int clientFd) {
     }
 
     std::string requestData;
-    {
-        std::lock_guard<std::mutex> lock(buffersMutex_);
-        requestData = clientBuffers_[clientFd];
+    if (!getClientBuffer(clientFd, requestData)) {
+        return;
     }
 
     if (!headerComplete && requestData.find("\r\n\r\n") == std::string::npos) {
         // 请求还没收完整，重新注册 EPOLLONESHOT，等待下一次可读事件。
-        poller_.modFd(clientFd, EPOLLIN | EPOLLONESHOT | EPOLLRDHUP);
+        finishProcessing(clientFd, true, false);
         return;
     }
 
     HttpRequest request;
     ParseResult parseResult = HttpParser::parse(requestData, request);
 
+    bool isHeadRequest = parseResult == ParseResult::Complete && request.method == "HEAD";
     HttpResponse response(200, "OK");
 
     if (parseResult == ParseResult::BadRequest || parseResult == ParseResult::Incomplete) {
         response = HttpResponse::text(400, "Bad Request", "Bad Request\n");
-    } else if (request.method != "GET") {
-        response = HttpResponse::text(405, "Method Not Allowed", "Method Not Allowed\n");
-        response.setHeader("Allow", "GET");
-    } else if (request.path == "/hello") {
-        response = HttpResponse::json("{\"message\":\"hello from tiny web server\"}");
     } else {
-        std::string filePath = FileUtil::buildFilePath(wwwRoot_, request.path);
-        std::string content;
-
-        if (filePath.empty() || !FileUtil::readFile(filePath, content)) {
-            response = HttpResponse::text(404, "Not Found", "404 Not Found\n");
-        } else {
-            response = HttpResponse(200, "OK");
-            response.setBody(content, FileUtil::getMimeType(filePath));
-        }
+        response = buildResponse(request, isHeadRequest);
     }
 
-    std::string pathForLog = request.path.empty() ? "-" : request.path;
-    Logger::instance().info(makeClientLogPrefix(clientFd) + "path=" + pathForLog +
-                            ", status=" + std::to_string(response.statusCode()));
+    bool keepAlive = parseResult == ParseResult::Complete &&
+                     shouldKeepAlive(request, response.statusCode());
+    response.setHeader("Connection", keepAlive ? "keep-alive" : "close");
+    if (keepAlive) {
+        response.setHeader("Keep-Alive", "timeout=" + std::to_string(idleTimeout_.count()));
+    }
 
-    sendAll(clientFd, response.toString());
-    closeClient(clientFd);
+    if (accessLogEnabled_) {
+        std::string pathForLog = request.path.empty() ? "-" : request.path;
+        Logger::instance().info(makeClientLogPrefix(clientFd) + "method=" +
+                                (request.method.empty() ? "-" : request.method) +
+                                ", path=" + pathForLog +
+                                ", status=" + std::to_string(response.statusCode()) +
+                                ", keep_alive=" + (keepAlive ? "true" : "false"));
+    }
+
+    sendAll(clientFd, response.toString(!isHeadRequest));
+
+    if (!keepAlive) {
+        closeClient(clientFd);
+        return;
+    }
+
+    finishProcessing(clientFd, true, true);
 }
 
 void TcpServer::closeClient(int clientFd) {
     poller_.delFd(clientFd);
     SocketUtil::closeFd(clientFd);
 
-    std::lock_guard<std::mutex> lock(buffersMutex_);
-    clientBuffers_.erase(clientFd);
+    std::lock_guard<std::mutex> lock(connectionsMutex_);
+    connections_.erase(clientFd);
+}
+
+void TcpServer::closeIdleConnections() {
+    std::vector<int> idleFds;
+    auto now = std::chrono::steady_clock::now();
+
+    {
+        std::lock_guard<std::mutex> lock(connectionsMutex_);
+        for (const auto& item : connections_) {
+            int fd = item.first;
+            const Connection& connection = item.second;
+            if (!connection.processing && now - connection.lastActive >= idleTimeout_) {
+                idleFds.push_back(fd);
+            }
+        }
+    }
+
+    for (int fd : idleFds) {
+        Logger::instance().info(makeClientLogPrefix(fd) + "idle timeout, close");
+        closeClient(fd);
+    }
+}
+
+bool TcpServer::markProcessing(int clientFd) {
+    std::lock_guard<std::mutex> lock(connectionsMutex_);
+    auto it = connections_.find(clientFd);
+    if (it == connections_.end() || it->second.processing) {
+        return false;
+    }
+
+    it->second.processing = true;
+    it->second.lastActive = std::chrono::steady_clock::now();
+    return true;
+}
+
+bool TcpServer::finishProcessing(int clientFd, bool keepAlive, bool clearBuffer) {
+    if (!keepAlive) {
+        closeClient(clientFd);
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(connectionsMutex_);
+        auto it = connections_.find(clientFd);
+        if (it == connections_.end()) {
+            return false;
+        }
+
+        it->second.processing = false;
+        it->second.lastActive = std::chrono::steady_clock::now();
+        if (clearBuffer) {
+            it->second.buffer.clear();
+        }
+    }
+
+    if (!poller_.modFd(clientFd, EPOLLIN | EPOLLONESHOT | EPOLLRDHUP)) {
+        closeClient(clientFd);
+        return false;
+    }
+
+    return true;
+}
+
+bool TcpServer::appendClientData(int clientFd, const char* data, size_t length,
+                                 bool& headerComplete, bool& requestTooLarge) {
+    std::lock_guard<std::mutex> lock(connectionsMutex_);
+    auto it = connections_.find(clientFd);
+    if (it == connections_.end()) {
+        return false;
+    }
+
+    it->second.buffer.append(data, length);
+    it->second.lastActive = std::chrono::steady_clock::now();
+    requestTooLarge = it->second.buffer.size() > kMaxRequestSize;
+    headerComplete = it->second.buffer.find("\r\n\r\n") != std::string::npos;
+    return true;
+}
+
+bool TcpServer::getClientBuffer(int clientFd, std::string& buffer) {
+    std::lock_guard<std::mutex> lock(connectionsMutex_);
+    auto it = connections_.find(clientFd);
+    if (it == connections_.end()) {
+        return false;
+    }
+
+    buffer = it->second.buffer;
+    return true;
 }
 
 bool TcpServer::sendAll(int clientFd, const std::string& data) {
@@ -246,7 +378,7 @@ bool TcpServer::sendAll(int clientFd, const std::string& data) {
             pfd.fd = clientFd;
             pfd.events = POLLOUT;
 
-            int ret = ::poll(&pfd, 1, 3000);
+            int ret = ::poll(&pfd, 1, kSendTimeoutMs);
             if (ret <= 0) {
                 Logger::instance().warn(makeClientLogPrefix(clientFd) + "send timeout");
                 return false;
@@ -264,4 +396,48 @@ bool TcpServer::sendAll(int clientFd, const std::string& data) {
     }
 
     return true;
+}
+
+bool TcpServer::shouldKeepAlive(const HttpRequest& request, int statusCode) const {
+    if (statusCode >= 400) {
+        return false;
+    }
+
+    std::string connection = toLower(request.getHeader("Connection"));
+    if (request.version == "HTTP/1.1") {
+        return connection != "close";
+    }
+
+    if (request.version == "HTTP/1.0") {
+        return connection == "keep-alive";
+    }
+
+    return false;
+}
+
+HttpResponse TcpServer::buildResponse(const HttpRequest& request, bool isHeadRequest) const {
+    if (request.method != "GET" && request.method != "HEAD") {
+        HttpResponse response = HttpResponse::text(405, "Method Not Allowed", "Method Not Allowed\n");
+        response.setHeader("Allow", "GET, HEAD");
+        return response;
+    }
+
+    if (request.path == "/hello") {
+        return HttpResponse::json("{\"message\":\"hello from tiny web server\"}");
+    }
+
+    std::string filePath = FileUtil::buildFilePath(wwwRoot_, request.path);
+    std::string content;
+
+    if (filePath.empty() || !FileUtil::readFile(filePath, content)) {
+        return HttpResponse::text(404, "Not Found", "404 Not Found\n");
+    }
+
+    HttpResponse response(200, "OK");
+    response.setBody(content, FileUtil::getMimeType(filePath));
+    if (isHeadRequest) {
+        // HEAD 与 GET 返回相同响应头，但响应体在发送阶段省略。
+        response.setHeader("Content-Length", std::to_string(content.size()));
+    }
+    return response;
 }

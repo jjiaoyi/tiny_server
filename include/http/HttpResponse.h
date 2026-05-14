@@ -9,7 +9,7 @@ public:
 
     void setHeader(const std::string& key, const std::string& value);
     void setBody(const std::string& body, const std::string& contentType);
-    std::string toString() const;
+    std::string toString(bool includeBody = true) const;
 
     int statusCode() const;
 
@@ -22,4 +22,3 @@ private:
     std::map<std::string, std::string> headers_;
     std::string body_;
 };
-

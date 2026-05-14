@@ -34,5 +34,7 @@ logs/
 *~
 .DS_Store
 
-# Local tool state
-.cache/
+.codex/
+.agents/
+
+bench/results/*.txt

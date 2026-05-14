@@ -1,6 +1,6 @@
 # 从零掌握 TinyWebServer 中的 Linux 网络编程全流程
 
-本文档面向“没怎么学过 Linux 网络编程，但想完整讲清楚本项目”的读者。目标不是把所有网络协议细节一次学完，而是围绕 TinyWebServer 这个项目，把一个 C++ Web 服务器从启动、监听、接收连接、读取请求、解析 HTTP、返回响应、关闭连接的全过程讲透。
+本文档面向“没怎么学过 Linux 网络编程，但想完整讲清楚本项目”的读者。目标不是把所有网络协议细节一次学完，而是围绕 TinyWebServer 这个项目，把一个 C++ Web 服务器从启动、监听、接收连接、读取请求、解析 HTTP、返回响应、长连接复用到关闭连接的全过程讲透。
 
 对应项目入口：
 
@@ -46,9 +46,10 @@ curl -i http://127.0.0.1:8080/hello
 
 ```http
 HTTP/1.1 200 OK
-Connection: close
+Connection: keep-alive
 Content-Length: 40
 Content-Type: application/json; charset=utf-8
+Keep-Alive: timeout=30
 Server: TinyWebServer
 
 {"message":"hello from tiny web server"}
@@ -69,9 +70,10 @@ Server: TinyWebServer
 11. `HttpParser` 解析请求行和请求头。
 12. 发现 path 是 `/hello`，构造 JSON 响应。
 13. worker 线程调用 `send` 写回响应。
-14. 服务器关闭 `client fd`。
+14. 如果客户端允许 keep-alive，服务器清空连接缓冲区并重新注册 epoll 事件。
+15. 如果客户端关闭连接、请求出错或空闲超时，服务器关闭 `client fd`。
 
-这个项目采用的是短连接：每次请求处理完就关闭连接，不做 HTTP keep-alive。
+当前项目支持 HTTP/1.1 keep-alive。也就是说，同一个 TCP 连接可以连续处理多个请求；如果连接空闲超过默认 30 秒，服务器会主动关闭它。
 
 ## 3. Linux 中“一切皆文件”和 fd
 
@@ -116,7 +118,7 @@ while (true) {
 - 线程池
 - HTTP 解析
 - 静态文件读取
-- 日志
+- 异步日志
 
 对应代码在 `src/net/SocketUtil.cpp` 和 `src/net/TcpServer.cpp`。
 
@@ -545,7 +547,7 @@ TCP 不保留应用层消息边界。客户端一次 `send` 的 HTTP 请求，�
 - 分多次 `recv` 才读完整。
 - 一次 `recv` 读到多个请求的一部分。
 
-本项目采用短连接和简化 HTTP，只处理请求头。判断请求头完整的标志是：
+本项目采用简化 HTTP 解析，只处理请求头。判断请求头完整的标志是：
 
 ```cpp
 "\r\n\r\n"
@@ -716,9 +718,10 @@ header name 会转成小写，方便大小写无关查询。
 
 ```http
 HTTP/1.1 200 OK
-Connection: close
+Connection: keep-alive
 Content-Length: 40
 Content-Type: application/json; charset=utf-8
+Keep-Alive: timeout=30
 Server: TinyWebServer
 
 {"message":"hello from tiny web server"}
@@ -743,7 +746,7 @@ Content-Length: 40
 
 告诉客户端响应体有多少字节。
 
-如果没有 `Content-Length`，客户端可能不知道响应体在哪里结束。虽然短连接可以靠连接关闭判断结束，但明确写 `Content-Length` 更规范。
+如果没有 `Content-Length`，客户端可能不知道响应体在哪里结束。短连接可以靠连接关闭判断结束，但长连接不会在每个响应后关闭连接，所以 `Content-Length` 对 keep-alive 尤其重要。
 
 本项目设置 body 时自动写入：
 
@@ -863,12 +866,12 @@ else if (request.path == "/hello") {
 
 ### 405 Method Not Allowed
 
-只支持 GET。如果是 POST、PUT、DELETE 等，返回 405。
+只支持 GET 和 HEAD。如果是 POST、PUT、DELETE 等，返回 405。
 
 同时会设置：
 
 ```http
-Allow: GET
+Allow: GET, HEAD
 ```
 
 ## 30. 日志模块
@@ -888,7 +891,13 @@ Allow: GET
 - 控制台
 - `logs/server.log`
 
-Logger 使用 `std::mutex` 保证多线程写日志时不会互相穿插。
+当前日志是异步日志：业务线程调用 `Logger::info/warn/error` 时，只把日志追加到内存缓冲区；后台日志线程定时取出缓冲区，统一写到控制台和日志文件。
+
+这样做的好处是：
+
+- worker 线程不会频繁阻塞在磁盘 I/O 上。
+- 多条日志可以批量写入，减少刷盘次数。
+- 前台线程只需要短时间持有互斥锁，日志开销更稳定。
 
 ## 31. 项目运行时的完整调用链
 
@@ -1065,7 +1074,7 @@ curl --noproxy '*' -i http://127.0.0.1:8080/
 5. 安全点：使用 `EPOLLONESHOT` 避免同一个 client fd 被多个线程同时处理。
 6. HTTP 层：解析请求行和 header，支持 GET、静态文件、JSON 接口。
 7. 工程化：CMake 构建、日志模块、测试脚本、README 文档。
-8. 边界：目前不支持 HTTPS、长连接、请求体和完整 HTTP/1.1，但结构上可扩展。
+8. 边界：目前不支持 HTTPS、请求体和完整 HTTP/1.1，但结构上可扩展。
 
 ## 35. 高频面试追问
 
@@ -1099,7 +1108,7 @@ TCP 不保留消息边界。应用层一次发送的数据，接收方可能分�
 
 ### 35.8 当前项目是否支持长连接？
 
-不支持。虽然能解析 `Connection` header，但响应固定 `Connection: close`，发送完响应就关闭 fd。要支持长连接，需要保留连接状态、处理多个请求、增加空闲超时。
+支持基础 HTTP keep-alive。HTTP/1.1 默认保持连接，除非请求头中带 `Connection: close`；HTTP/1.0 只有显式带 `Connection: keep-alive` 才保持连接。worker 处理完请求后，如果需要保持连接，会清空当前请求缓冲区并通过 `epoll_ctl MOD` 重新注册 `EPOLLONESHOT`。主线程还会定期关闭超过默认 30 秒没有活动的空闲连接。
 
 ### 35.9 如何支持 POST 请求体？
 
@@ -1112,8 +1121,8 @@ TCP 不保留消息边界。应用层一次发送的数据，接收方可能分�
 - 使用边缘触发 `EPOLLET`。
 - 拆分 I/O 线程和业务线程。
 - 使用连接状态机。
-- 增加定时器关闭空闲连接。
-- 使用异步日志。
+- 使用更精细的时间堆或时间轮管理空闲连接。
+- 优化异步日志缓冲和刷盘策略。
 - 使用零拷贝 `sendfile` 发送静态文件。
 - 减少大锁粒度。
 
@@ -1137,14 +1146,13 @@ TinyWebServer 当前代码正好是第 4 到第 8 步的综合版本。
 为了适合初学者和面试讲解，本项目刻意没有做这些复杂功能：
 
 - HTTPS/TLS。
-- HTTP keep-alive。
 - chunked transfer encoding。
 - 请求体解析。
 - CGI/FastCGI。
 - 完整 MIME 类型表。
 - 高性能缓存。
 - 多 Reactor。
-- 定时器管理。
+- 高精度定时器管理。
 - 压测级优化。
 
 这不是缺点，而是边界清晰。面试时要主动说明：
@@ -1202,4 +1210,3 @@ TinyWebServer 的核心就是：
 > 主线程用非阻塞 socket 和 epoll 管理大量连接事件，用 `EPOLLONESHOT` 保证同一连接不会被多个线程同时处理，再把具体 HTTP 解析、静态文件读取和响应发送交给线程池完成。
 
 如果你能把这句话展开讲 5 到 10 分钟，并能从源码指出每一步在哪里实现，就基本掌握了本项目蕴含的 Linux 网络编程全流程。
-

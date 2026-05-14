@@ -18,7 +18,7 @@ void HttpResponse::setBody(const std::string& body, const std::string& contentTy
     headers_["Content-Length"] = std::to_string(body_.size());
 }
 
-std::string HttpResponse::toString() const {
+std::string HttpResponse::toString(bool includeBody) const {
     // 响应格式：状态行 + 响应头 + 空行 + 响应体。
     std::ostringstream oss;
     oss << "HTTP/1.1 " << statusCode_ << " " << reason_ << "\r\n";
@@ -28,7 +28,9 @@ std::string HttpResponse::toString() const {
     }
 
     oss << "\r\n";
-    oss << body_;
+    if (includeBody) {
+        oss << body_;
+    }
     return oss.str();
 }
 
@@ -47,4 +49,3 @@ HttpResponse HttpResponse::json(const std::string& body) {
     response.setBody(body, "application/json; charset=utf-8");
     return response;
 }
-
