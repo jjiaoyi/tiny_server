@@ -18,7 +18,9 @@ cmake --build build
 ./build/tiny_webserver 8080 www 4 logs/server.log 0
 ```
 
-另开终端运行压测：
+## Linux 跑
+
+如果在 Linux 或虚拟机里直接压测，可以用项目自带的 Python/socket 脚本：
 
 ```bash
 python3 bench/bench_http.py --host 127.0.0.1 --port 8080 --path /hello --connections 50 --duration 10
@@ -48,6 +50,42 @@ python3 bench/bench_http.py --host 127.0.0.1 --port 8080 --path / --connections 
 CONNECTION_CASES="100 200 500 1000" DURATION=20 REQUEST_PATH=/ ./bench/run_concurrency_matrix.sh
 ```
 
+也可以用 Linux 版 `bombardier` 脚本，输出 CSV 和原始日志：
+
+```bash
+./bench/run_linux_bombardier_matrix.sh
+```
+
+默认访问 `http://127.0.0.1:8080/`，默认并发组为 `10 50 100 200 500 1000`，每组持续 30 秒。可以按需覆盖：
+
+```bash
+URL="http://10.241.34.106:8080/" \
+CONNECTION_CASES="50 100 200 500 1000" \
+DURATION_SECONDS=30 \
+./bench/run_linux_bombardier_matrix.sh
+```
+
+Linux 脚本会在 `bench/results/` 下保存一份 `.csv` 汇总和一份 `.txt` 原始日志。
+
+## Windows 跑
+
+如果服务器跑在虚拟机里，可以在 Windows 本机用 `bombardier` 压测虚拟机地址：
+
+```powershell
+bench\run_windows_bombardier_matrix.ps1
+```
+
+脚本默认访问 `http://10.241.34.106:8080/`，默认并发组为 `10, 50, 100, 200, 500, 1000`，每组持续 30 秒。可以按需覆盖：
+
+```powershell
+bench\run_windows_bombardier_matrix.ps1 `
+  -Url "http://10.241.34.106:8080/hello" `
+  -Connections 50,100,200,500 `
+  -DurationSeconds 20
+```
+
+Windows 脚本会在 `bench/results/` 下保存一份 `.csv` 汇总和一份 `.txt` 原始日志。
+
 
 ## 输出指标
 
@@ -70,4 +108,3 @@ CONNECTION_CASES="100 200 500 1000" DURATION=20 REQUEST_PATH=/ ./bench/run_concu
 |   200 | 153040 | 153040 |     0 | 7640.96 | 25.57ms | 20.68ms |  50.56ms |  87.25ms |
 |   500 | 154888 | 154888 |     0 | 7711.79 | 52.77ms | 36.93ms | 116.65ms | 221.91ms |
 |  1000 | 152021 | 152021 |     0 | 7549.60 | 58.91ms | 41.00ms | 134.28ms | 273.66ms |
-
