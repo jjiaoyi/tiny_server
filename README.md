@@ -13,6 +13,10 @@ TinyWebServer 支持基础 HTTP/1.1 请求解析和静态文件访问：
 - 不支持的方法返回 `405`
 - 请求格式错误返回 `400`
 
+如果你希望从零学习本项目涉及的 Linux 网络编程流程，可以阅读：
+
+- [从零掌握 TinyWebServer 中的 Linux 网络编程全流程](docs/linux_network_programming_from_zero.md)
+
 ## 架构说明
 
 项目分为五个核心模块：
@@ -142,4 +146,3 @@ bash tests/simple_test.sh
 ### 如何继续优化？
 
 可以增加长连接支持、定时器关闭空闲连接、更完整的 HTTP 解析、统一错误页、异步日志、配置文件、压测和更细粒度的连接状态管理。
-
