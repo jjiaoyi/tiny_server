@@ -15,11 +15,6 @@ TinyWebServer 支持基础 HTTP/1.1 请求解析、静态文件访问和长连�
 - 不支持的方法返回 `405`
 - 请求格式错误返回 `400`
 
-如果你希望从零学习本项目涉及的 Linux 网络编程流程，可以阅读：
-
-- [从零掌握 TinyWebServer 中的 Linux 网络编程全流程](docs/linux_network_programming_from_zero.md)
-- [TinyWebServer 使用、压测与实现检查](docs/server_usage_and_review.md)
-
 ## 架构说明
 
 项目分为五个核心模块：
@@ -116,11 +111,10 @@ Connection: keep-alive
 
 ## 项目边界说明
 
-当前项目定位是“简历可写、面试可讲、代码能跑、压测能复现”的轻量级 WebServer，不宣称工业级能力。
+当前项目定位是“简历可写、面试可讲、代码能跑、功能可验证”的轻量级 WebServer，不宣称工业级能力。
 
 - 网络模型是简化 Reactor：主线程负责 epoll 事件监听和分发，worker 线程负责连接读写、HTTP 解析和响应构造。
 - 当前没有实现多 Reactor、完整异步写事件、时间轮、零拷贝 `sendfile`、完整 HTTP/1.1、HTTPS 或数据库连接池。
-- 压测结果和机器环境强相关，仓库只提供可复现脚本，不预置 QPS 或延迟数据。
 
 ## 编译运行方式
 
@@ -159,45 +153,30 @@ curl -i http://127.0.0.1:8080/notfound.html
 bash tests/simple_test.sh
 ```
 
-## 压测方式
+## 虚拟机网络环境说明
 
-仓库提供一个仅依赖 Python 标准库的 keep-alive 压测脚本，便于在没有 `wrk` 或 `ab` 的环境中复现基础指标。
+为了更接近真实网络访问场景，可以把 server 跑在虚拟机中，再从宿主机或同网段机器访问虚拟机 IP。
 
-启动服务器：
+当前虚拟机 IP：
 
-```bash
-./build/tiny_webserver 8080 www 4 logs/server.log 0
+```text
+10.241.34.106
 ```
 
-运行压测：
+在虚拟机中启动服务器：
 
 ```bash
-python3 bench/bench_http.py --host 127.0.0.1 --port 8080 --path /hello --connections 50 --duration 10
+./build/tiny_webserver 8080 www 4 logs/server.log
 ```
 
-补充多组并发连接阶梯压测：
+在宿主机或同网段机器访问：
 
 ```bash
-./bench/run_concurrency_matrix.sh
+curl -i http://10.241.34.106:8080/
+curl -i http://10.241.34.106:8080/hello
 ```
 
-默认依次运行 `50 100 200 500 1000` 个 keep-alive 连接。可以通过环境变量调整：
-
-```bash
-CONNECTION_CASES="100 200 500 1000" DURATION=20 REQUEST_PATH=/hello ./bench/run_concurrency_matrix.sh
-```
-
-只补跑 1000 连接：
-
-```bash
-CONNECTION_CASES="1000" DURATION=20 REQUEST_PATH=/hello ./bench/run_concurrency_matrix.sh
-```
-
-脚本会输出请求总数、成功/失败请求数、requests/sec、平均延迟和 P50/P90/P99 延迟。请在自己的机器上运行后记录结果，不要把示例命令当作固定性能数据。
-
-建议压测时把最后一个 `access_log` 参数设为 `0`，关闭逐请求访问日志；否则大量日志输出会明显干扰吞吐和延迟结果。功能调试或面试演示请求流程时再设为 `1`。
-
-记录模板见 [bench/README.md](bench/README.md)。
+如果虚拟机 IP 变化，以上命令中的 IP 需要同步更新。
 
 ## 常见面试追问与回答
 
@@ -223,7 +202,7 @@ CONNECTION_CASES="1000" DURATION=20 REQUEST_PATH=/hello ./bench/run_concurrency_
 
 ### 为什么不直接说是工业级高性能服务器？
 
-因为当前项目的目标是学习和面试讲解：代码完整可运行，覆盖 Linux 网络编程主流程，并提供可复现压测脚本。但它还没有实现多 Reactor、完整异步写、零拷贝、成熟定时器和完整 HTTP 协议，不能包装成工业级服务器。
+因为当前项目的目标是学习和面试讲解：代码完整可运行，覆盖 Linux 网络编程主流程。但它还没有实现多 Reactor、完整异步写、零拷贝、成熟定时器和完整 HTTP 协议，不能包装成工业级服务器。
 
 ### 当前 HTTP 支持完整吗？
 
@@ -231,4 +210,4 @@ CONNECTION_CASES="1000" DURATION=20 REQUEST_PATH=/hello ./bench/run_concurrency_
 
 ### 如何继续优化？
 
-可以增加更完整的 HTTP 解析、统一错误页、配置文件、压测、数据库连接池、定时器堆、更细粒度的连接状态机和多 Reactor 模型。
+可以增加更完整的 HTTP 解析、统一错误页、配置文件、数据库连接池、定时器堆、更细粒度的连接状态机和多 Reactor 模型。
